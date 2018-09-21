@@ -165,71 +165,51 @@ extern const char early_idt_handler_array[NUM_EXCEPTION_VECTORS][EARLY_IDT_HANDL
 
 The `early_idt_handler_array` is `288` bytes array which contains address of exception entry points every nine bytes. Every nine bytes of this array consist of two bytes optional instruction for pushing dummy error code if an exception does not provide it, two bytes instruction for pushing vector number to the stack and five bytes of `jump` to the common exception handler code.
 
-As we can see, We're filling only first 32 `IDT` entries in the loop, because all of the early setup runs with interrupts disabled, so there is no need to set up interrupt handlers for vectors greater than `32`. The `early_idt_handler_array` array contains generic idt handlers and we can find its definition in the [arch/x86/kernel/head_64.S](https://github.com/torvalds/linux/blob/16f73eb02d7e1765ccab3d2018e0bd98eb93d973/arch/x86/kernel/head_64.S) assembly file. For now we will skip it, but will look it soon. Before this we will look on the implementation of the `set_intr_gate` macro.
+As we can see, We're filling only first 32 `IDT` entries in the loop, because all of the early setup runs with interrupts disabled, so there is no need to set up interrupt handlers for vectors greater than `32`. The `early_idt_handler_array` array contains generic idt handlers and we can find its definition in the [arch/x86/kernel/head_64.S](https://github.com/torvalds/linux/blob/16f73eb02d7e1765ccab3d2018e0bd98eb93d973/arch/x86/kernel/head_64.S) assembly file. For now we will skip it, but will look it soon. Before this we will look on the implementation of the `set_intr_gate` function.
 
-The `set_intr_gate` macro is defined in the [arch/x86/include/asm/desc.h](https://github.com/torvalds/linux/blob/16f73eb02d7e1765ccab3d2018e0bd98eb93d973/arch/x86/include/asm/desc.h) header file and looks:
-
-```C
-#define set_intr_gate(n, addr)                         \
-         do {                                                            \
-                 BUG_ON((unsigned)n > 0xFF);                             \
-                 _set_gate(n, GATE_INTERRUPT, (void *)addr, 0, 0,        \
-                           __KERNEL_CS);                                 \
-                 _trace_set_gate(n, GATE_INTERRUPT, (void *)trace_##addr,\
-                                 0, 0, __KERNEL_CS);                     \
-         } while (0)
-```
-
-First of all it checks with that passed interrupt number is not greater than `255` with `BUG_ON` macro. We need to do this check because we can have only `256` interrupts. After this, it make a call of the `_set_gate` function which writes address of an interrupt gate to the `IDT`:
+The `set_intr_gate` function is defined in the [arch/x86/kernel/idt.c](https://github.com/torvalds/linux/blob/master/arch/x86/kernel/idt.c) source file and looks:
 
 ```C
-static inline void _set_gate(int gate, unsigned type, void *addr,
-	                         unsigned dpl, unsigned ist, unsigned seg)
+static void set_intr_gate(unsigned int n, const void *addr)
 {
-         gate_desc s;
-         pack_gate(&s, type, (unsigned long)addr, dpl, ist, seg);
-         write_idt_entry(idt_table, gate, &s);
-         write_trace_idt_entry(gate, &s);
+	struct idt_data data;
+
+	BUG_ON(n > 0xFF);
+
+	memset(&data, 0, sizeof(data));
+	data.vector	= n;
+	data.addr	= addr;
+	data.segment	= __KERNEL_CS;
+	data.bits.type	= GATE_INTERRUPT;
+	data.bits.p	= 1;
+
+        idt_setup_from_table(idt_table, &data, 1, false);
 }
 ```
 
-At the start of `_set_gate` function we can see call of the `pack_gate` function which fills `gate_desc` structure with the given values:
+First of all it checks with that passed interrupt number is not greater than `255` with `BUG_ON` macro. We need to do this check because we can have only `256` interrupts. After this, we setup the idt data with the given values. And then we call `idt_setup_from_table` function which looks like:
 
 ```C
-static inline void pack_gate(gate_desc *gate, unsigned type, unsigned long func,
-                             unsigned dpl, unsigned ist, unsigned seg)
+static void
+idt_setup_from_table(gate_desc *idt, const struct idt_data *t, int size, bool sys)
 {
-        gate->offset_low        = PTR_LOW(func);
-        gate->segment           = __KERNEL_CS;
-        gate->ist               = ist;
-        gate->p                 = 1;
-        gate->dpl               = dpl;
-        gate->zero0             = 0;
-        gate->zero1             = 0;
-        gate->type              = type;
-        gate->offset_middle     = PTR_MIDDLE(func);
-        gate->offset_high       = PTR_HIGH(func);
+	gate_desc desc;
+
+	for (; size > 0; t++, size--) {
+		desc.offset_low    = (u16) t->addr;
+		desc.segment	   = (u16) t->segment
+		desc.bits	   = t->bits;
+		desc.offset_middle = (u16) (t->addr >> 16);
+		desc.offset_high   = (u32) (t->addr >> 32);
+		desc.reserved	   = 0;
+		memcpy(&idt[t->vector], &desc, sizeof(desc));
+		if (sys)
+			set_bit(t->vector, system_vectors);
+	}
 }
 ```
 
-As I mentioned above, we fill gate descriptor in this function. We fill three parts of the address of the interrupt handler with the address which we got in the main loop (address of the interrupt handler entry point). We are using three following macros to split address on three parts:
-
-```C
-#define PTR_LOW(x) ((unsigned long long)(x) & 0xFFFF)
-#define PTR_MIDDLE(x) (((unsigned long long)(x) >> 16) & 0xFFFF)
-#define PTR_HIGH(x) ((unsigned long long)(x) >> 32)
-```
-
-With the first `PTR_LOW` macro we get the first `2` bytes of the address, with the second `PTR_MIDDLE` we get the second `2` bytes of the address and with the third `PTR_HIGH` macro we get the last `4` bytes of the address. Next we setup the segment selector for interrupt handler, it will be our kernel code segment - `__KERNEL_CS`. In the next step we fill `Interrupt Stack Table` and `Descriptor Privilege Level` (highest privilege level) with zeros. And we set `GAT_INTERRUPT` type in the end. 
-
-Now we have filled IDT entry and we can call `native_write_idt_entry` function which just copies filled `IDT` entry to the `IDT`:
-
-```C
-static inline void native_write_idt_entry(gate_desc *idt, int entry, const gate_desc *gate)
-{
-        memcpy(&idt[entry], gate, sizeof(*gate));
-}
-```
+which fill three parts of the address of the interrupt handler with the address which we got in the main loop (address of the interrupt handler entry point). And then we just copy the gate descriptor to the idt entry.
 
 After that main loop will finished, we will have filled `idt_table` array of `gate_desc` structures and we can load `Interrupt Descriptor table` with the call of the:
 
@@ -240,7 +220,10 @@ load_idt((const struct desc_ptr *)&idt_descr);
 Where `idt_descr` is:
 
 ```C
-struct desc_ptr idt_descr = { NR_VECTORS * 16 - 1, (unsigned long) idt_table };
+struct desc_ptr idt_descr __ro_after_init = {
+	.size		= (IDT_ENTRIES * 2 * sizeof(unsigned long)) - 1,
+	.address	= (unsigned long) idt_table,
+};
 ```
 
 and `load_idt` just executes `lidt` instruction:
@@ -256,24 +239,29 @@ Okay, now we have filled and loaded `Interrupt Descriptor Table`, we know how th
 Early interrupts handlers
 --------------------------------------------------------------------------------
 
-As you can read above, we filled `IDT` with the address of the `early_idt_handler_array`. We can find it in the [arch/x86/kernel/head_64.S](https://github.com/torvalds/linux/blob/16f73eb02d7e1765ccab3d2018e0bd98eb93d973/arch/x86/kernel/head_64.S) assembly file:
+As you can read above, we filled `IDT` with the address of the `early_idt_handler_array`. We can find it in the [arch/x86/kernel/head_64.S](https://github.com/torvalds/linux/blob/master/arch/x86/kernel/head_64.S) assembly file:
 
 ```assembly
-	.globl early_idt_handler_array
-early_idt_handlers:
+ENTRY(early_idt_handler_array)
 	i = 0
 	.rept NUM_EXCEPTION_VECTORS
-	.if (EXCEPTION_ERRCODE_MASK >> i) & 1
-	pushq $0
+	.if ((EXCEPTION_ERRCODE_MASK >> i) & 1) == 0
+		UNWIND_HINT_IRET_REGS
+		pushq $0	# Dummy error code, to make stack frame uniform
+	.else
+		UNWIND_HINT_IRET_REGS offset=8
 	.endif
-	pushq $i
+	pushq $i		# 72(%rsp) Vector number
 	jmp early_idt_handler_common
+	UNWIND_HINT_IRET_REGS
 	i = i + 1
 	.fill early_idt_handler_array + i*EARLY_IDT_HANDLER_SIZE - ., 1, 0xcc
 	.endr
+	UNWIND_HINT_IRET_REGS offset=16
+END(early_idt_handler_array)
 ```
 
-We can see here, interrupt handlers generation for the first `32` exceptions. We check here, if exception has an error code then we do nothing, if exception does not return error code, we push zero to the stack. We do it for that would stack was uniform. After that we push exception number on the stack and jump on the `early_idt_handler_array` which is generic interrupt handler for now. As we may see above, every nine bytes of the `early_idt_handler_array` array consists from optional push of an error code, push of `vector number` and jump instruction. We can see it in the output of the `objdump` util:
+Functions which tend to not be called directly by other functions, such as syscall and interrupt handlers, often do unusual non-C-function-type things with the stack pointer. Such code needs to be annotated by using `UNWIND_HINT_IRET_REGS` macro such that objtool can understand it. We can see here, interrupt handlers generation for the first `32` exceptions. We check here, if exception has an error code then we do nothing, if exception does not return error code, we push zero to the stack. We do it for that would stack was uniform. After that we push exception number on the stack and jump on the `early_idt_handler_array` which is generic interrupt handler for now. As we may see above, every nine bytes of the `early_idt_handler_array` array consists from optional push of an error code, push of `vector number` and jump instruction. We can see it in the output of the `objdump` util:
 
 ```
 $ objdump -D vmlinux
@@ -301,52 +289,42 @@ As i wrote above, CPU pushes flag register, `CS` and `RIP` on the stack. So befo
 | %rflags            |
 | %cs                |
 | %rip               |
-| rsp --> error code |
+| error code         | <-- %rsp
 |--------------------|
 ```
 
-Now let's look on the `early_idt_handler_common` implementation. It locates in the same [arch/x86/kernel/head_64.S](https://github.com/torvalds/linux/blob/16f73eb02d7e1765ccab3d2018e0bd98eb93d973/arch/x86/kernel/head_64.S#L343) assembly file and first of all we can see check for [NMI](http://en.wikipedia.org/wiki/Non-maskable_interrupt). We don't need to handle it, so just ignore it in the `early_idt_handler_common`:
+Now let's look on the `early_idt_handler_common` implementation. It locates in the same [arch/x86/kernel/head_64.S](https://github.com/torvalds/linux/blob/master/arch/x86/kernel/head_64.S) assembly file and first of all we increment `early_recursion_flag` to prevent recursion in the `early_idt_handler_common`:
 
 ```assembly
-	cmpl $2,(%rsp)
-	je .Lis_nmi
+	incl early_recursion_flag(%rip)
 ```
 
-where `is_nmi`:
+Next we save general registers on the stack:
 
 ```assembly
-is_nmi:
-	addq $16,%rsp
-	INTERRUPT_RETURN
-```
-
-drops an error code and vector number from the stack and call `INTERRUPT_RETURN` which is just expands to the `iretq` instruction. As we checked the vector number and it is not `NMI`, we check `early_recursion_flag` to prevent recursion in the `early_idt_handler_common` and if it's correct we save general registers on the stack:
-
-```assembly
-	pushq %rax
-	pushq %rcx
-	pushq %rdx
 	pushq %rsi
-	pushq %rdi
+	movq 8(%rsp), %rsi
+	movq %rdi, 8(%rsp)
+	pushq %rdx
+	pushq %rcx
+	pushq %rax
 	pushq %r8
 	pushq %r9
 	pushq %r10
 	pushq %r11
+	pushq %rbx
+	pushq %rbp
+	pushq %r12
+	pushq %r13
+	pushq %r14
+	pushq %r15
+	UNWIND_HINT_REGS
 ```
 
-We need to do it to prevent wrong values of registers when we return from the interrupt handler. After this we check segment selector in the stack:
+We need to do it to prevent wrong values of registers when we return from the interrupt handler. After this we check the vector number, and if it is `#PF` or [Page Fault](https://en.wikipedia.org/wiki/Page_fault), we put value from the `cr2` to the `rdi` register and call `early_make_pgtable` (we'll see it soon):
 
 ```assembly
-	cmpl $__KERNEL_CS,96(%rsp)
-	jne 11f
-```
-
-which must be equal to the kernel code segment and if it is not we jump on label `11` which prints `PANIC` message and makes stack dump.
-
-After the code segment was checked, we check the vector number, and if it is `#PF` or [Page Fault](https://en.wikipedia.org/wiki/Page_fault), we put value from the `cr2` to the `rdi` register and call `early_make_pgtable` (well see it soon):
-
-```assembly
-	cmpl $14,72(%rsp)
+	cmpq $14,%rsi
 	jnz 10f
 	GET_CR2_INTO(%rdi)
 	call early_make_pgtable
@@ -354,21 +332,23 @@ After the code segment was checked, we check the vector number, and if it is `#P
 	jz 20f
 ```
 
-If vector number is not `#PF`, we restore general purpose registers from the stack:
+If vector number is not `#PF`, we call `early_fixup_exception` function with passing kernel stack pointer. (refer to [x86-64 calling convention](https://en.wikipedia.org/wiki/X86_calling_conventions#x86-64_calling_conventions)):
 
 ```assembly
-	popq %r11
-	popq %r10
-	popq %r9
-	popq %r8
-	popq %rdi
-	popq %rsi
-	popq %rdx
-	popq %rcx
-	popq %rax
+10:
+	movq %rsp,%rdi
+	call early_fixup_exception
 ```
 
-and exit from the handler with `iret`.
+We'll see the implementaion of the `early_fixup_exception` function later.
+
+```assembly
+20:
+	decl early_recursion_flag(%rip)
+	jmp restore_regs_and_return_to_kernel
+```
+
+After we decrement the `early_recursion_flag`, we restore registers which we saved earlier from the stack and return from the handler with `iretq`.
 
 It is the end of the first interrupt handler. Note that it is very early interrupt handler, so it handles only Page Fault now. We will see handlers for the other interrupts, but now let's look on the page fault handler.
 
@@ -377,16 +357,30 @@ Page fault handling
 
 In the previous paragraph we saw first early interrupt handler which checks interrupt number for page fault and calls `early_make_pgtable` for building new page tables if it is. We need to have `#PF` handler in this step because there are plans to add ability to load kernel above `4G` and make access to `boot_params` structure above the 4G.
 
-You can find implementation of the `early_make_pgtable` in the [arch/x86/kernel/head64.c](https://github.com/torvalds/linux/blob/16f73eb02d7e1765ccab3d2018e0bd98eb93d973/arch/x86/kernel/head64.c) and takes one parameter - address from the `cr2` register, which caused Page Fault. Let's look on it:
+You can find implementation of the `early_make_pgtable` in the [arch/x86/kernel/head64.c](https://github.com/torvalds/linux/blob/master/arch/x86/kernel/head64.c) and takes one parameter - address from the `cr2` register, which caused Page Fault. Let's look on it:
 
 ```C
 int __init early_make_pgtable(unsigned long address)
 {
 	unsigned long physaddr = address - __PAGE_OFFSET;
-	unsigned long i;
+	pmdval_t pmd;
+
+	pmd = (physaddr & PMD_MASK) + early_pmd_flags;
+
+	return __early_make_pgtable(address, pmd);
+}
+```
+
+Next we call `__early_make_pgtable` function which is defined in the same file as `early_make_pgtable` function as following:
+
+```C
+int __init __early_make_pgtable(unsigned long address, pmdval_t pmd)
+{
+	unsigned long physaddr = address - __PAGE_OFFSET;
 	pgdval_t pgd, *pgd_p;
+	p4dval_t p4d, *p4d_p;
 	pudval_t pud, *pud_p;
-	pmdval_t pmd, *pmd_p;
+	pmdval_t *pmd_p;
 	...
 	...
 	...
@@ -399,7 +393,7 @@ It starts from the definition of some variables which have `*val_t` types. All o
 typedef unsigned long   pgdval_t;
 ```
 
-Also we will operate with the `*_t` (not val) types, for example `pgd_t` and etc... All of these types defined in the [arch/x86/include/asm/pgtable_types.h](https://github.com/torvalds/linux/blob/16f73eb02d7e1765ccab3d2018e0bd98eb93d973/arch/x86/include/asm/pgtable_types.h) and represent structures like this:
+Also we will operate with the `*_t` (not val) types, for example `pgd_t` and etc... All of these types are defined in the [arch/x86/include/asm/pgtable_types.h](https://github.com/torvalds/linux/blob/master/arch/x86/include/asm/pgtable_types.h) and represent structures like this:
 
 ```C
 typedef struct { pgdval_t pgd; } pgd_t;
@@ -408,22 +402,38 @@ typedef struct { pgdval_t pgd; } pgd_t;
 For example,
 
 ```C
-extern pgd_t early_level4_pgt[PTRS_PER_PGD];
+extern pgd_t early_top_pgt[PTRS_PER_PGD];
 ```
 
-Here `early_level4_pgt` presents early top-level page table directory which consists of an array of `pgd_t` types and `pgd` points to low-level page entries.
+Here `early_top_pgt` presents early top-level page table directory which consists of an array of `pgd_t` types and `pgd` points to low-level page entries.
 
-After we made the check that we have no invalid address, we're getting the address of the Page Global Directory entry which contains `#PF` address and put it's value to the `pgd` variable:
+After we made the check that we have no invalid address, we're getting the address of the Page Global Directory entry which contains `#PF` address and put its value to the `pgd` variable:
 
 ```C
-pgd_p = &early_level4_pgt[pgd_index(address)].pgd;
+pgd_p = &early_top_pgt[pgd_index(address)].pgd;
 pgd = *pgd_p;
 ```
 
-In the next step we check `pgd`, if it contains correct page global directory entry we put physical address of the page global directory entry and put it to the `pud_p` with:
+Next we check if five-layer paging is enabled:
 
 ```C
-pud_p = (pudval_t *)((pgd & PTE_PFN_MASK) + __START_KERNEL_map - phys_base);
+if (!pgtable_l5_enabled())
+	p4d_p = pgd_p;
+```
+
+In most cases five-layer paging is not enabled, so `p4d_p` most likely equals to `pgd_p`.
+
+After this we fix up address of the p4d with:
+
+```C
+p4d_p += p4d_index(address);
+p4d = *p4d_p;
+```
+
+In the next step we check `p4d`, if it contains correct p4d entry we put physical address of the p4d entry and put it to the `pud_p` with:
+
+```C
+pud_p = (pudval_t *)((p4d & PTE_PFN_MASK) + __START_KERNEL_map - phys_base);
 ```
 
 where `PTE_PFN_MASK` is a macro:
@@ -435,18 +445,18 @@ where `PTE_PFN_MASK` is a macro:
 which expands to:
 
 ```C
-(~(PAGE_SIZE-1)) & ((1 << 46) - 1)
+(signed long)(~(PAGE_SIZE-1)) & ((1 << 52) - 1)
 ```
 
-or
+Here [sign-extension](https://en.wikipedia.org/wiki/Sign_extension) is used. To be more expanded:
 
 ```
-0b1111111111111111111111111111111111111111111111
+0b1111111111111111111111111111111111111111111111111111
 ```
 
-which is 46 bits to mask page frame.
+which is 52 bits to mask page frame.
 
-If `pgd` does not contain correct address we check that `next_early_pgt` is not greater than `EARLY_DYNAMIC_PAGE_TABLES` which is `64` and present a fixed number of buffers to set up new page tables on demand. If `next_early_pgt` is greater than `EARLY_DYNAMIC_PAGE_TABLES` we reset page tables and start again. If `next_early_pgt` is less than `EARLY_DYNAMIC_PAGE_TABLES`, we create new page upper directory pointer which points to the current dynamic page table and writes it's physical address with the `_KERPG_TABLE` access rights to the page global directory:
+If `p4d` does not contain correct address we check that `next_early_pgt` is not greater than `EARLY_DYNAMIC_PAGE_TABLES` which is `64` and present a fixed number of buffers to set up new page tables on demand. If `next_early_pgt` is greater than `EARLY_DYNAMIC_PAGE_TABLES` we reset page tables and start again. If `next_early_pgt` is less than `EARLY_DYNAMIC_PAGE_TABLES`, we create new page upper directory pointer which points to the current dynamic page table and writes its physical address with the `_KERNPG_TABLE` access rights to the p4d:
 
 ```C
 if (next_early_pgt >= EARLY_DYNAMIC_PAGE_TABLES) {
@@ -457,10 +467,10 @@ if (next_early_pgt >= EARLY_DYNAMIC_PAGE_TABLES) {
 pud_p = (pudval_t *)early_dynamic_pgts[next_early_pgt++];
 for (i = 0; i < PTRS_PER_PUD; i++)
 	pud_p[i] = 0;
-*pgd_p = (pgdval_t)pud_p - __START_KERNEL_map + phys_base + _KERNPG_TABLE;
+*p4d_p = (p4dval_t)pud_p - __START_KERNEL_map + phys_base + _KERNPG_TABLE;
 ```
 
-After this we fix up address of the page upper directory with:
+As we did above, we fix up address of the page upper directory with:
 
 ```C
 pud_p += pud_index(address);
@@ -470,11 +480,101 @@ pud = *pud_p;
 In the next step we do the same actions as we did before, but with the page middle directory. In the end we fix address of the page middle directory which contains maps kernel text+data virtual addresses:
 
 ```C
-pmd = (physaddr & PMD_MASK) + early_pmd_flags;
 pmd_p[pmd_index(address)] = pmd;
 ```
 
-After page fault handler finished it's work and as result our `early_level4_pgt` contains entries which point to the valid addresses.
+After page fault handler finished its work and as result our `early_top_pgt` contains entries which point to the valid addresses.
+
+Other exception handling
+--------------------------------------------------------------------------------
+
+In early interrupt phase, exceptions other than page fault are handled by `early_fixup_exception` function which is defined in [arch/x86/mm/extable.c](https://github.com/torvalds/linux/blob/master/arch/x86/mm/extable.c) and takes two parameters - pointer to kernel stack which consists of saved registers and interrupt number:
+
+```C
+void __init early_fixup_exception(struct pt_regs *regs, int trapnr)
+{
+	...
+	...
+	...
+}
+```
+
+First of all we need to pass some condition expressions.
+
+```C
+	if (trapnr == X86_TRAP_NMI)
+		return;
+
+	if (early_recursion_flag > 2)
+		goto halt_loop;
+
+	if (!xen_pv_domain() && regs->cs != __KERNEL_CS)
+		goto fail;
+```
+
+Here we just ignore [NMI](https://en.wikipedia.org/wiki/Non-maskable_interrupt). And we make sure that we are not in recursive situation. After that, we get into:
+
+```C
+	if (fixup_exception(regs, trapnr))
+		return;
+```
+
+The `fixup_exception` function is defined in the same file as `early_fixup_exception` function and looks like:
+
+```C
+int fixup_exception(struct pt_regs *regs, int trapnr)
+{
+	const struct exception_table_entry *e;
+	ex_handler_t handler;
+
+	e = search_exception_tables(regs->ip);
+	if (!e)
+		return 0;
+
+	handler = ex_fixup_handler(e);
+	return handler(e, regs, trapnr);
+}
+```
+
+The `ex_handler_t` is a type of function pointer, which is defined like:
+
+```C
+typedef bool (*ex_handler_t)(const struct exception_table_entry *,
+                            struct pt_regs *, int)
+```
+
+The `search_exception_tables` function looks up the given address in the exception table (i.e. the contents of the ELF section __ex_table). After that, we get the actual address by `ex_fixup_handler` function. At last we call actual handler. For more information about exception table, you can refer to [Documentation/x86/exception-tables.txt](https://github.com/torvalds/linux/blob/master/Documentation/x86/exception-tables.txt).
+
+Back to `early_fixup_exception` function, the next step is:
+
+```C
+	if (fixup_bug(regs, trapnr))
+		return;
+```
+
+The `fixup_bug` function is defined in [arch/x86/kernel/traps.c](https://github.com/torvalds/linux/blob/master/arch/x86/kernel/traps.c). Let's have a look on the function implementation.
+
+```C
+int fixup_bug(struct pt_regs *regs, int trapnr)
+{
+	if (trapnr != X86_TRAP_UD)
+		return 0;
+
+	switch (report_bug(regs->ip, regs)) {
+	case BUG_TRAP_TYPE_NONE:
+	case BUG_TRAP_TYPE_BUG:
+		break;
+
+	case BUG_TRAP_TYPE_WARN:
+		regs->ip += LEN_UD2;
+		return 1;
+	}
+
+	return 0;
+}
+```
+
+All what this funtion do is just return `1` if the exception is generated because `#UD` (or [Invalid Opcode](https://wiki.osdev.org/Exceptions#Invalid_Opcode)) occured and the `report_bug` function returns `BUG_TRAP_TYPE_WARN`, otherwise return `0`.
 
 Conclusion
 --------------------------------------------------------------------------------
